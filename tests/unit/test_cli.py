@@ -492,9 +492,90 @@ def test_recursive_scan_exception_marks_combined_execution_as_failed(tmp_path: P
     assert payload["execution_successful"] is False
     assert payload["skills"][1] == {
         "name": "two",
+        "path": "two",
         "error": "A recursive child scan failed before complete inspection.",
     }
     assert "TOKEN=child-scan-secret" not in output.read_text()
+
+
+def _nested_skill_dir(root: Path, relative_path: str) -> Path:
+    directory = root / relative_path
+    directory.mkdir(parents=True)
+    (directory / "SKILL.md").write_text("---\nname: skill\n---\n", encoding="utf-8")
+    return directory
+
+
+def test_scan_multiple_paths_scans_each_as_skill_with_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Several input paths are scanned as independent skills sharing one baseline."""
+    _nested_skill_dir(tmp_path, "skills/a")
+    _nested_skill_dir(tmp_path, "tools/nested/b")
+    baseline = tmp_path / "baseline.yaml"
+    baseline.write_text("version: 2\nsuppressions: []\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    with patch("skillspector.cli._scan_multi_skill") as scan_multi_skill:
+        result = runner.invoke(
+            app,
+            [
+                "scan",
+                "skills/a",
+                "tools/nested/b",
+                "--no-llm",
+                "--format",
+                "json",
+                "-b",
+                str(baseline),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    detection = scan_multi_skill.call_args.args[0]
+    assert [skill.relative_path for skill in detection.skills] == ["skills/a", "tools/nested/b"]
+    assert [skill.path for skill in detection.skills] == [
+        (tmp_path / "skills" / "a").resolve(),
+        (tmp_path / "tools" / "nested" / "b").resolve(),
+    ]
+    assert scan_multi_skill.call_args.kwargs["baseline"] == baseline
+
+
+def test_scan_multiple_paths_rejects_invalid_baseline_before_scanning(tmp_path: Path) -> None:
+    """An invalid baseline fails once with its own error instead of failing every child."""
+    first = _nested_skill_dir(tmp_path, "a")
+    second = _nested_skill_dir(tmp_path, "b")
+    baseline = tmp_path / "baseline.yaml"
+    baseline.write_text("version: 2\nrules:\n  - id: TT3\n", encoding="utf-8")
+
+    with patch("skillspector.cli._scan_multi_skill") as scan_multi_skill:
+        result = runner.invoke(
+            app, ["scan", str(first), str(second), "--no-llm", "-b", str(baseline)]
+        )
+
+    assert result.exit_code == 2
+    assert "Error:" in result.output
+    scan_multi_skill.assert_not_called()
+
+
+def test_scan_multiple_paths_rejects_file_input(tmp_path: Path) -> None:
+    """Every explicit path must be a skill directory."""
+    first = _nested_skill_dir(tmp_path, "a")
+
+    result = runner.invoke(app, ["scan", str(first), str(first / "SKILL.md"), "--no-llm"])
+
+    assert result.exit_code == 2
+    assert "not a directory" in result.output
+
+
+def test_scan_multiple_paths_rejects_recursive(tmp_path: Path) -> None:
+    """Explicit skill paths and recursive discovery are mutually exclusive."""
+    first = _nested_skill_dir(tmp_path, "a")
+    second = _nested_skill_dir(tmp_path, "b")
+
+    result = runner.invoke(app, ["scan", str(first), str(second), "--recursive"])
+
+    assert result.exit_code == 2
+    assert "multiple input paths" in result.output
 
 
 def test_recursive_scan_string_risk_score_counts_toward_exit_code(tmp_path: Path) -> None:
@@ -1401,7 +1482,7 @@ def test_scan_multi_skill_json_stdout_survives_child_failure(
     payload = json.loads(captured.out)
     assert payload["execution_successful"] is False
     expected_error = "A recursive child scan failed before complete inspection."
-    assert payload["skills"][1] == {"name": "broken", "error": expected_error}
+    assert payload["skills"][1] == {"name": "broken", "path": "broken", "error": expected_error}
     assert f"Error: {expected_error}" in captured.err
 
 
@@ -2614,7 +2695,7 @@ def test_cli_scan_recursive_json_includes_full_skill_payload(
     assert "risk_assessment" not in delta
 
     broken = by_name["broken"]
-    assert broken == {"name": "broken", "error": "scan failed"}
+    assert broken == {"name": "broken", "path": "broken", "error": "scan failed"}
 
 
 # ---------------------------------------------------------------------------

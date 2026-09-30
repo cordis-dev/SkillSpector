@@ -338,6 +338,32 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
     )
 
 
+def explicit_skills(paths: list[str]) -> MultiSkillDetectionResult:
+    """Build a multi-skill result from caller-selected skill directories.
+
+    Unlike :func:`detect_skills`, no discovery runs: each path is scanned as
+    one skill, so skills may live at any depth. ``relative_path`` keeps the
+    path as given so callers can map combined-report entries back to inputs.
+    """
+    skills: list[SkillDirectory] = []
+    for raw_path in paths:
+        directory = validate_local_input_path(Path(os.path.abspath(raw_path)))
+        if not directory.is_dir():
+            raise ValueError(f"Input path is not a directory: {raw_path}")
+        skills.append(
+            SkillDirectory(
+                path=directory,
+                name=_sanitize_display_component(directory.name),
+                relative_path=raw_path,
+                local_only=any(
+                    part.startswith(".") and part not in {".", ".."}
+                    for part in Path(raw_path).parts
+                ),
+            )
+        )
+    return MultiSkillDetectionResult(is_multi_skill=True, skills=skills)
+
+
 def _read_error(resource: str) -> _DetectionIncompleteError:
     """Build a sanitized filesystem-failure signal."""
     return _DetectionIncompleteError(

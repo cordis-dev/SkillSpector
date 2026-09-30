@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 import skillspector.multi_skill as multi_skill_module
-from skillspector.multi_skill import detect_skills
+from skillspector.multi_skill import detect_skills, explicit_skills
 
 
 @pytest.fixture
@@ -686,3 +686,32 @@ class TestDetectSkills:
         result = detect_skills(tmp_path)
         assert result.is_multi_skill is True
         assert len(result.skills) == 2
+
+
+class TestExplicitSkills:
+    """Tests for explicit_skills()."""
+
+    def test_keeps_paths_as_given_at_any_depth(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Each path is one skill; relative_path maps report entries back to inputs."""
+        (tmp_path / "skills" / "a").mkdir(parents=True)
+        (tmp_path / ".claude" / "skills" / "b").mkdir(parents=True)
+        monkeypatch.chdir(tmp_path)
+
+        result = explicit_skills(["skills/a", ".claude/skills/b"])
+
+        assert result.is_multi_skill is True
+        assert result.complete is True
+        assert [skill.relative_path for skill in result.skills] == ["skills/a", ".claude/skills/b"]
+        assert [skill.name for skill in result.skills] == ["a", "b"]
+        assert all(skill.path.is_absolute() for skill in result.skills)
+        assert [skill.local_only for skill in result.skills] == [False, True]
+
+    def test_rejects_file_path(self, tmp_path: Path) -> None:
+        """A skill path must be a directory."""
+        manifest = tmp_path / "SKILL.md"
+        manifest.write_text("---\nname: a\n---\n", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="not a directory"):
+            explicit_skills([str(tmp_path), str(manifest)])

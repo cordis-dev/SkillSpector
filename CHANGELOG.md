@@ -1,5 +1,6 @@
 ### 2.12.0 (Unreleased)
 ### Features/Bug Fixes
+* feat(cli): scan several skill directories in one run with a shared baseline
 * fix(security): retain incomplete coverage for runtime-selected commands and remeasure active Git clones strictly (#514)
 * fix(scan): preserve required-input failures and multiline prompt uncertainty (#563)
 * fix(analyzer): preserve Perl print literal ownership and explain referenced-artifact limitations (#615)

@@ -58,7 +58,12 @@ from skillspector.inspection_ledger import (
 from skillspector.logging_config import get_logger, set_level
 from skillspector.mcp_registry import scan_registry
 from skillspector.models import Finding
-from skillspector.multi_skill import MultiSkillDetectionResult, SkillDirectory, detect_skills
+from skillspector.multi_skill import (
+    MultiSkillDetectionResult,
+    SkillDirectory,
+    detect_skills,
+    explicit_skills,
+)
 from skillspector.nodes.analyzers import ANALYZER_MODULES, ANALYZER_NODE_IDS
 from skillspector.nodes.report import report
 from skillspector.sarif_models import SARIF_SCHEMA_URI, validate_sarif_report
@@ -412,10 +417,13 @@ def _multi_skill_limitation_events(
 
 @app.command()
 def scan(
-    input_path: Annotated[
-        str,
+    input_paths: Annotated[
+        list[str],
         typer.Argument(
-            help="Path or URL to scan. Supports: Git URL, file URL, zip file, .md file, or directory.",
+            help="Path or URL to scan. Supports: Git URL, file URL, zip file, .md file, or "
+            "directory. Several skill directories scan each one as its own skill and "
+            "produce a combined report.",
+            metavar="INPUT_PATH...",
         ),
     ],
     format: Annotated[
@@ -554,6 +562,7 @@ def scan(
         skillspector scan ./my-skill/ --format json --output report.json
         skillspector scan https://github.com/user/my-skill --no-llm
         skillspector scan ./skill-collection/ --recursive
+        skillspector scan ./skills/a/ ./tools/b/ --baseline baseline.yaml
 
     Environment variables:
 
@@ -587,6 +596,14 @@ def scan(
         gemini_cli, and opencode_cli use their CLI's existing local
         authentication session.
     """
+    input_path = input_paths[0]
+    if len(input_paths) > 1 and (mcp_registry or recursive):
+        err_console.print(
+            "[red]Error:[/red] multiple input paths cannot be combined with "
+            "--mcp-registry or --recursive"
+        )
+        raise typer.Exit(code=2)
+
     if mcp_registry:
         if recursive or baseline is not None or show_suppressed or yara_rules_dir is not None:
             err_console.print(
@@ -636,6 +653,32 @@ def scan(
         err_console.print(f"[red]Error:[/red] invalid transitive prefix: {exc}")
         raise typer.Exit(code=2) from exc
     yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
+    if len(input_paths) > 1:
+        try:
+            detection = explicit_skills(input_paths)
+            # One invalid baseline would otherwise fail every child scan with a generic error.
+            if baseline is not None:
+                load_baseline(baseline)
+        except (FileNotFoundError, ValueError) as e:
+            err_console.print(f"[red]Error:[/red] {e}")
+            raise typer.Exit(code=2) from e
+        _scan_multi_skill(
+            detection,
+            format=format,
+            output=output,
+            no_llm=no_llm,
+            baseline=baseline,
+            show_suppressed=show_suppressed,
+            transitive_enabled=transitive_enabled,
+            transitive_depth=transitive_depth,
+            transitive_allow_prefix=transitive_allow_prefix,
+            transitive_deny_prefix=transitive_deny_prefix,
+            yara_dir=yara_dir,
+            verbose=verbose,
+            fail_on_incomplete=fail_on_incomplete,
+            fail_on_findings=fail_on_findings,
+        )
+        return
     pre_scan_ledger_events: list[dict[str, object]] = []
     discovery_console = (
         err_console if output is None and format is not FormatChoice.terminal else console
@@ -2947,7 +2990,9 @@ def _scan_multi_skill(
         combined_skills = cast(list[dict[str, object]], combined["skills"])
         for skill, result in zip(processed_skills, results, strict=True):
             if "error" in result:
-                combined_skills.append({"name": skill.name, "error": result["error"]})
+                combined_skills.append(
+                    {"name": skill.name, "path": skill.relative_path, "error": result["error"]}
+                )
             else:
                 payload = _recursive_json_payload(result) or {}
                 finding_count = len(effective_findings(result))
