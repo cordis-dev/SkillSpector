@@ -552,6 +552,14 @@ def scan(
             help="Scan an MCP Registry payload or URL instead of a skill.",
         ),
     ] = False,
+    combined_report: Annotated[
+        bool,
+        typer.Option(
+            "--combined-report",
+            help="Scan each input path as its own skill directory and always write the "
+            "combined multi-skill report, even for a single path. Implied by several paths.",
+        ),
+    ] = False,
 ) -> None:
     """
     Scan a skill for security vulnerabilities.
@@ -563,6 +571,7 @@ def scan(
         skillspector scan https://github.com/user/my-skill --no-llm
         skillspector scan ./skill-collection/ --recursive
         skillspector scan ./skills/a/ ./tools/b/ --baseline baseline.yaml
+        skillspector scan ./skills/a/ --combined-report --format json
 
     Environment variables:
 
@@ -597,10 +606,11 @@ def scan(
         authentication session.
     """
     input_path = input_paths[0]
-    if len(input_paths) > 1 and (mcp_registry or recursive):
+    combined_report = combined_report or len(input_paths) > 1
+    if combined_report and (mcp_registry or recursive):
         err_console.print(
-            "[red]Error:[/red] multiple input paths cannot be combined with "
-            "--mcp-registry or --recursive"
+            "[red]Error:[/red] multiple input paths and --combined-report cannot be "
+            "combined with --mcp-registry or --recursive"
         )
         raise typer.Exit(code=2)
 
@@ -653,7 +663,7 @@ def scan(
         err_console.print(f"[red]Error:[/red] invalid transitive prefix: {exc}")
         raise typer.Exit(code=2) from exc
     yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
-    if len(input_paths) > 1:
+    if combined_report:
         try:
             detection = explicit_skills(input_paths)
             # One invalid baseline would otherwise fail every child scan with a generic error.

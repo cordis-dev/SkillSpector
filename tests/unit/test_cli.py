@@ -557,6 +557,21 @@ def test_scan_multiple_paths_rejects_invalid_baseline_before_scanning(tmp_path: 
     scan_multi_skill.assert_not_called()
 
 
+def test_scan_combined_report_scans_single_path_as_skill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--combined-report gives one path the same combined report as several paths."""
+    _nested_skill_dir(tmp_path, "skills/a")
+    monkeypatch.chdir(tmp_path)
+
+    with patch("skillspector.cli._scan_multi_skill") as scan_multi_skill:
+        result = runner.invoke(app, ["scan", "skills/a", "--combined-report", "--no-llm"])
+
+    assert result.exit_code == 0, result.output
+    detection = scan_multi_skill.call_args.args[0]
+    assert [skill.relative_path for skill in detection.skills] == ["skills/a"]
+
+
 def test_scan_multiple_paths_rejects_file_input(tmp_path: Path) -> None:
     """Every explicit path must be a skill directory."""
     first = _nested_skill_dir(tmp_path, "a")
