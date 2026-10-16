@@ -64,6 +64,7 @@ from skillspector.inspection_ledger import (
     LedgerOutcome,
     LedgerReason,
     LedgerRecordType,
+    inspection_work_id,
     ledger_event,
 )
 from skillspector.llm_provenance import capture_llm_provenance, capture_static_llm_provenance
@@ -75,6 +76,7 @@ from skillspector.nested_artifacts import (
     is_executable_content,
     is_zip_content,
 )
+from skillspector.oms import project_oms_content
 from skillspector.python_ast import (
     PythonSourceClassification,
     classify_python_source,
@@ -907,7 +909,7 @@ def _decode_base64_json(value: object) -> dict[str, object] | None:
 
 
 def _is_valid_oms_signature_bytes(data: bytes) -> bool:
-    """Recognize the minimal OMS DSSE/in-toto structure from bounded bytes."""
+    """Recognize OMS structure only; this does not verify or trust its contents."""
     try:
         if len(data) > MAX_FILE_BYTES:
             return False
@@ -2896,16 +2898,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             elif signature_valid:
                 recognized_oms_signature_paths.add(_OMS_SIGNATURE_PATH)
     recognized_oms_signatures = frozenset(recognized_oms_signature_paths)
-    signature_events = [
-        ledger_event(
-            outcome=LedgerOutcome.OUT_OF_SCOPE,
-            record_type=LedgerRecordType.SCOPE_BOUNDARY,
-            phase="discovery",
-            path=path,
-            reason=LedgerReason.OMS_SIGNATURE,
-        )
-        for path in sorted(recognized_oms_signatures)
-    ]
+    signature_events: list[InspectionLedgerEvent] = []
     baseline_events = [
         ledger_event(
             outcome=LedgerOutcome.OUT_OF_SCOPE,
@@ -2916,12 +2909,6 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         )
         for path in sorted(selected_baselines)
     ]
-    for artifact in artifact_inventory:
-        if artifact["path"] in recognized_oms_signatures:
-            artifact["disposition"] = ArtifactDisposition.OUT_OF_SCOPE
-            artifact["reason"] = LedgerReason.OMS_SIGNATURE.value
-            llm_file_cache.pop(artifact["path"], None)
-
     primary_path = next(
         (path for path in ("SKILL.md", "skill.md") if path in inventoried_components), None
     )
@@ -3089,8 +3076,6 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     ordinary_components: list[str] = []
     for path in cache_candidates:
         ordinary_artifact = inventory_by_path.get(path)
-        if path in recognized_oms_signatures:
-            continue
         if path in raw_file_cache or (
             ordinary_artifact is not None
             and ordinary_artifact.get("disposition")
@@ -3121,10 +3106,14 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     nested_input_cache = {**raw_file_cache, **excluded_archive_cache}
     nested = inspect_nested_artifacts(
         skill_dir,
-        [
-            *(path for path in ordinary_components if path in raw_file_cache),
-            *excluded_archive_cache,
-        ],
+        sorted(
+            [
+                *(path for path in ordinary_components if path in raw_file_cache),
+                *excluded_archive_cache,
+            ],
+            # Expand real containers before another archive can claim their children.
+            key=lambda path: -path.count("!/"),
+        ),
         raw_file_cache=nested_input_cache,
         max_members=remaining_artifacts,
         max_uncompressed_bytes=remaining_bytes,
@@ -3334,28 +3323,86 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             limitation_reason=limitation_reason,
         )
 
+    # Only an actual collision is fatal: ordinary directories may end in "!".
+    nested_paths = (
+        {item["path"] for item in nested.artifact_inventory}
+        | set(nested.components)
+        | set(nested.file_cache)
+        | set(nested.raw_file_cache)
+    )
+    reserved_paths = {item["path"] for item in artifact_inventory} & nested_paths
+    member_containers = {
+        str(item["path"]): str(item["outer_path"])
+        for item in nested.metadata
+        if item["path"] in reserved_paths and item.get("outer_path")
+    }
+    for path in sorted(reserved_paths):
+        container = member_containers.get(path, path.rsplit("!/", 1)[0])
+        event = ledger_event(
+            outcome=LedgerOutcome.PARTIAL,
+            record_type=LedgerRecordType.SYSTEM,
+            phase="nested_artifact_inspection",
+            path=container,
+            reason=LedgerReason.ARCHIVE_AMBIGUOUS_MEMBER_PATH,
+        )
+        event["message"] += (
+            f" Archive member file {path!r} was not analyzed because it collides with a disk file."
+            " Distinct descendant members may still be analyzed."
+        )
+        prework_events.append(event)
+    disk_container_event_ids = {id(event) for event in nested.disk_container_events}
+    for event in nested.ledger_events:
+        path = event["path"]
+        if path in reserved_paths:
+            if id(event) in disk_container_event_ids:
+                continue
+            event["path"] = member_containers.get(path, path.rsplit("!/", 1)[0])
+            event["work_id"] = inspection_work_id(
+                f"{event['record_type'].value}:{event['phase']}", event["path"], None, None
+            )
+            event["message"] += (
+                f" This applies to withheld archive member {path!r}, not the disk file."
+            )
+    for artifact in artifact_inventory:
+        if artifact["path"] in reserved_paths:
+            artifact["disposition"] = ArtifactDisposition.FAILED
+            artifact["reason"] = LedgerReason.ARTIFACT_PATH_COLLISION.value
+            prework_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.FAILED,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="discovery",
+                    path=artifact["path"],
+                    reason=LedgerReason.ARTIFACT_PATH_COLLISION,
+                )
+            )
+    blocked_nested_paths = excluded_nested_components | reserved_paths
+    nested.metadata = [item for item in nested.metadata if item["path"] not in reserved_paths]
+    nested.python_source_classifications = {
+        path: classification
+        for path, classification in nested.python_source_classifications.items()
+        if path not in blocked_nested_paths
+    }
     ordinary_nested_components = [
-        path for path in nested.components if path not in excluded_nested_components
+        path for path in nested.components if path not in blocked_nested_paths
     ]
     local_file_cache = dict(ordinary_file_cache)
     local_file_cache.update(
-        {
-            path: data
-            for path, data in nested.file_cache.items()
-            if path not in excluded_nested_components
-        }
+        {path: data for path, data in nested.file_cache.items() if path not in blocked_nested_paths}
     )
     raw_file_cache.update(
         {
             path: data
             for path, data in nested.raw_file_cache.items()
-            if path not in excluded_nested_components
+            if path not in blocked_nested_paths
         }
     )
-    artifact_inventory.extend(nested.artifact_inventory)
+    artifact_inventory.extend(
+        item for item in nested.artifact_inventory if item["path"] not in reserved_paths
+    )
     for artifact in artifact_inventory:
         override = nested.inventory_overrides.get(artifact["path"])
-        if override is not None:
+        if override is not None and artifact["disposition"] != ArtifactDisposition.FAILED:
             artifact["disposition"], artifact["reason"] = override
     inventory_by_path = {item["path"]: item for item in artifact_inventory}
 
@@ -3411,7 +3458,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             ]
         )
     )
-    for path in [*recognized_containers, *recognized_oms_signatures]:
+    for path in recognized_containers:
         llm_file_cache.pop(path, None)
 
     postprocessing_events: list[InspectionLedgerEvent] = []
@@ -3583,6 +3630,46 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                 limit_seconds=runtime_limit,
             )
         )
+
+    for path, content in local_file_cache.items():
+        if not content.lstrip().startswith("{"):
+            continue
+        projection_started = monotonic()
+        if projection_started >= processing_deadline:
+            _record_processing_runtime(
+                phase="signature_projection", path=path, now=projection_started
+            )
+            continue
+        projection = project_oms_content(content)
+        if projection is None:
+            continue
+        projection_finished = monotonic()
+        if projection_finished >= processing_deadline:
+            _record_processing_runtime(
+                phase="signature_projection", path=path, now=projection_finished
+            )
+            continue
+        artifact = inventory_by_path.get(path)
+        bounded_provider_view = artifact is not None and (
+            artifact.get("disposition") == ArtifactDisposition.PARTIAL
+            and artifact.get("reason")
+            in {LedgerReason.SIZE_LIMIT.value, LedgerReason.TOTAL_BYTES_LIMIT.value}
+        )
+        if path in llm_file_cache and projection.view.name != "raw" and not bounded_provider_view:
+            llm_file_cache[path] = projection.view.text
+        if not projection.complete:
+            signature_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="discovery",
+                    path=path,
+                    reason=LedgerReason.OMS_SIGNATURE,
+                )
+            )
+            if artifact is not None and artifact["disposition"] == ArtifactDisposition.ANALYZED:
+                artifact["disposition"] = ArtifactDisposition.PARTIAL
+                artifact["reason"] = LedgerReason.OMS_SIGNATURE.value
 
     llm_components = sorted(llm_file_cache)
     file_cache = dict(llm_file_cache)
