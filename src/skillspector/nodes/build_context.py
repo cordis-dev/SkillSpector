@@ -42,6 +42,7 @@ from skillspector.artifacts import (
     ArtifactDisposition,
     ArtifactRecord,
     ContentKind,
+    binary_instruction_view,
     classify_artifact,
     decode_text,
     promote_artifact_to_decoded_text,
@@ -73,10 +74,11 @@ from skillspector.nested_artifacts import (
     expected_container_type,
     has_binary_executable_magic,
     inspect_nested_artifacts,
+    is_archive_content,
     is_executable_content,
-    is_zip_content,
 )
 from skillspector.oms import project_oms_content
+from skillspector.providers import prepare_chat_model_imports
 from skillspector.python_ast import (
     PythonSourceClassification,
     classify_python_source,
@@ -125,7 +127,7 @@ MAX_MANIFEST_YAML_DEPTH = 64
 MAX_MANIFEST_PARSE_SECONDS = 1.0
 MAX_MANIFEST_OUTPUT_RECORDS = 1_024
 MAX_MANIFEST_OUTPUT_CHARACTERS = 256 * 1024
-_EXECUTABLE_PROBE_BYTES = 8
+_EXECUTABLE_PROBE_BYTES = 1024
 
 
 def _is_allowed_inactive_git_hook_template(path: str, probe: bytes) -> bool:
@@ -147,6 +149,7 @@ def _is_allowed_inactive_git_hook_template(path: str, probe: bytes) -> bool:
 # File type by extension
 _FILE_TYPES: dict[str, str] = {
     ".md": "markdown",
+    ".mdc": "markdown",
     ".markdown": "markdown",
     ".py": "python",
     ".pyw": "python",
@@ -159,6 +162,8 @@ _FILE_TYPES: dict[str, str] = {
     ".toml": "toml",
     ".txt": "text",
     ".js": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
     ".ts": "typescript",
     ".rb": "ruby",
     ".go": "go",
@@ -1111,8 +1116,13 @@ def _mark_unanalyzed_executables(
             disposition is ArtifactDisposition.PARTIAL
             and len(raw) < max(0, int(artifact.get("size_bytes", 0)))
         )
+        readable_executable = bool(artifact.get("readable_binary"))
         if content_kind is ContentKind.BINARY:
-            reason = LedgerReason.BINARY_CONTENT
+            reason = (
+                LedgerReason.BINARY_EXECUTABLE_TEXT
+                if readable_executable
+                else LedgerReason.BINARY_CONTENT
+            )
         elif disposition is ArtifactDisposition.OUT_OF_SCOPE:
             reason = LedgerReason.OPAQUE_CONTENT
         elif disposition is ArtifactDisposition.FAILED or incomplete_bytes:
@@ -1141,19 +1151,29 @@ def _mark_unanalyzed_executables(
                 "container_depth": component.get("container_depth", path.count("!/")),
                 "outer_hidden": component.get("outer_hidden", hidden),
                 "concealed_executable": True,
-                "excluded_from_analysis": True,
+                "excluded_from_analysis": not readable_executable,
+                "partially_analyzed_executable": readable_executable,
                 "inherited_exclusion_reason": reason.value,
                 "concealment_reasons": list(dict.fromkeys([*reason_list, reason.value])),
             }
         )
         artifact.setdefault("reason", reason.value)
+        if readable_executable and artifact["disposition"] in {
+            ArtifactDisposition.ANALYZED,
+            ArtifactDisposition.OUT_OF_SCOPE,
+        }:
+            artifact["disposition"] = ArtifactDisposition.PARTIAL
         events.append(
             ledger_event(
                 outcome=LedgerOutcome.PARTIAL,
                 record_type=LedgerRecordType.SYSTEM,
                 phase="coverage_policy",
                 path=path,
-                reason=LedgerReason.EXCLUDED_EXECUTABLE_CONTENT,
+                reason=(
+                    LedgerReason.BINARY_EXECUTABLE_TEXT
+                    if readable_executable
+                    else LedgerReason.EXCLUDED_EXECUTABLE_CONTENT
+                ),
             )
         )
     return events
@@ -1257,7 +1277,7 @@ def _inspect_excluded_artifacts(
     """Inventory excluded files and fail closed on statically executable content.
 
     Ordinary excluded files require only the longest executable/archive magic prefix.
-    ZIP-family outers are read once into a private bounded cache for local nested
+    Supported archives are read once into a private bounded cache for local nested
     inspection. Excluded bytes are never added to provider-visible caches, and every
     byte is charged to both the bundle-local and graph-wide input budgets.
     """
@@ -1499,7 +1519,7 @@ def _inspect_excluded_artifacts(
                         file_stat.st_mode,
                         complete_content=len(probe) == size_bytes,
                     )
-                archive_candidate = is_zip_content(probe)
+                archive_candidate = is_archive_content(probe)
                 expected_archive = expected_container_type(path) is not None
                 if expected_archive and not archive_candidate:
                     record_partial(
@@ -2052,8 +2072,10 @@ def _read_file_cache(
             if (
                 provider_submission_allowed
                 and not _is_hidden_path(path)
-                and artifact["content_kind"] == "text"
+                and (artifact["content_kind"] == "text" or artifact.get("readable_binary"))
             ):
+                if artifact.get("readable_binary"):
+                    content = binary_instruction_view(content)[0].text
                 if truncated:
                     content = _llm_view_of_truncated_file(
                         content,
@@ -2678,7 +2700,7 @@ def _unsupported_primary_bytes(
 ) -> bool:
     """Recognize opaque primary content without opening or expanding containers.
 
-    ZIPs are handled separately by bounded nested inspection. Other archive
+    Supported archives are handled separately by bounded nested inspection. Other archive
     headers and UTF-16/32 instructions must not count as decoded source text,
     even when their bytes happen to be valid UTF-8 (for example an ASCII TAR).
     Python source is decoded by its PEP 263 declaration rather than as UTF-8,
@@ -2949,6 +2971,11 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                     skill_dir,
                     source_path=primary_path,
                     source_text=primary_text,
+                    metadata_root=(
+                        Path(str(state["primary_file_parent_path"]))
+                        if state.get("primary_file_parent_path")
+                        else None
+                    ),
                     known_paths=sorted(
                         dict.fromkeys(
                             [*inventoried_components, *excluded_artifacts, *user_excluded]
@@ -3046,11 +3073,13 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                 reason=(
                     LedgerReason.REFERENCE_MISSING
                     if reference["status"] == "missing"
+                    else LedgerReason.REFERENCED_UNINSPECTED
+                    if reference["status"] == "uninspected"
                     else LedgerReason.REFERENCE_UNRESOLVED
                 ),
             )
             for reference in references
-            if reference["status"] in {"missing", "ambiguous"}
+            if reference["status"] in {"missing", "ambiguous", "uninspected"}
         )
 
     referenced_paths = frozenset(
@@ -3228,7 +3257,9 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             continue
         nested_exclusion_reason = excluded_archive_reasons[outer_path]
         nested_artifact["inherited_exclusion_reason"] = nested_exclusion_reason.value
-        if nested_artifact["disposition"] is ArtifactDisposition.ANALYZED:
+        if nested_artifact["disposition"] is ArtifactDisposition.ANALYZED or (
+            nested_artifact.get("readable_binary") and not nested_artifact.get("reason")
+        ):
             nested_artifact["disposition"] = ArtifactDisposition.OUT_OF_SCOPE
             nested_artifact["reason"] = nested_exclusion_reason.value
         elif nested_artifact["disposition"] is ArtifactDisposition.OUT_OF_SCOPE:
@@ -3404,10 +3435,16 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         override = nested.inventory_overrides.get(artifact["path"])
         if override is not None and artifact["disposition"] != ArtifactDisposition.FAILED:
             artifact["disposition"], artifact["reason"] = override
+        if artifact["path"] in nested.inspected_containers:
+            artifact["inspected_members"] = nested.inspected_containers[artifact["path"]]
+            if artifact["disposition"] is ArtifactDisposition.OUT_OF_SCOPE and not artifact.get(
+                "reason"
+            ):
+                artifact["disposition"] = ArtifactDisposition.ANALYZED
     inventory_by_path = {item["path"]: item for item in artifact_inventory}
 
     recognized_containers = frozenset(nested.outer_metadata)
-    primary_content_events: list[InspectionLedgerEvent] = []
+    content_interpretation_events: list[InspectionLedgerEvent] = []
     selected_primary = state.get("primary_file_path")
     for artifact in artifact_inventory:
         path = artifact["path"]
@@ -3418,7 +3455,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             "SKILL.md",
             "skill.md",
         }
-        if not required or path in nested.recognized_zip_paths:
+        if not required or path in nested.recognized_container_paths:
             continue
         data = raw_file_cache.get(path)
         if data is None or not _unsupported_primary_bytes(
@@ -3435,7 +3472,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         artifact["disposition"] = ArtifactDisposition.FAILED
         artifact["reason"] = LedgerReason.UNSUPPORTED_PRIMARY_CONTENT.value
         llm_file_cache.pop(path, None)
-        primary_content_events.append(
+        content_interpretation_events.append(
             ledger_event(
                 outcome=LedgerOutcome.FAILED,
                 record_type=LedgerRecordType.SYSTEM,
@@ -3630,6 +3667,42 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                 limit_seconds=runtime_limit,
             )
         )
+
+    # Python's successful source decode takes precedence over a magic prefix.
+    for artifact in artifact_inventory:
+        path = artifact["path"]
+        if (
+            not artifact.get("readable_binary")
+            or artifact["content_kind"] != ContentKind.BINARY
+            or path in excluded_nested_components
+        ):
+            continue
+        _, projection_truncated = binary_instruction_view(local_file_cache.get(path, ""))
+        partial = bool(artifact.get("referenced"))
+        reason = LedgerReason.SIZE_LIMIT if projection_truncated else LedgerReason.OPAQUE_CONTENT
+        if artifact["disposition"] == ArtifactDisposition.ANALYZED:
+            artifact["disposition"] = (
+                ArtifactDisposition.PARTIAL if partial else ArtifactDisposition.OUT_OF_SCOPE
+            )
+        content_interpretation_events.append(
+            ledger_event(
+                outcome=LedgerOutcome.OUT_OF_SCOPE,
+                record_type=LedgerRecordType.SCOPE_BOUNDARY,
+                phase="cache",
+                path=path,
+                reason=LedgerReason.BINARY_TEXT_PROJECTION,
+            )
+        )
+        if partial:
+            content_interpretation_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="cache",
+                    path=path,
+                    reason=reason,
+                )
+            )
 
     for path, content in local_file_cache.items():
         if not content.lstrip().startswith("{"):
@@ -3868,6 +3941,16 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         if target and target in disposition_by_path:
             reference["disposition"] = disposition_by_path[target]
 
+    remaining_seconds = transitive_remaining_seconds(state)
+    if use_llm and remaining_seconds is not None and remaining_seconds > 0:
+        try:
+            prepare_chat_model_imports()
+        except Exception as exc:
+            # Optional eager imports must preserve normal provider failure handling.
+            logger.debug("Could not prepare AI transport imports (%s)", type(exc).__name__)
+        remaining_seconds = transitive_remaining_seconds(state)
+        if remaining_seconds is not None and remaining_seconds <= 0:
+            logger.debug("Workflow deadline reached while preparing AI transport imports")
     model_config = build_model_config() if use_llm else {}
     llm_provenance = (
         capture_llm_provenance(model_config)
@@ -3901,7 +3984,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                 *reference_events,
                 *cache_events,
                 *nested.ledger_events,
-                *primary_content_events,
+                *content_interpretation_events,
                 *excluded_nested_events,
                 *classification_events,
                 *manifest_events,
